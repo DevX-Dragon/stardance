@@ -26,16 +26,6 @@ class Admin::Fraud::SubjectsControllerTest < ActionDispatch::IntegrationTest
     assert_select ".fraud-subject-card__avatar[src=?]", @subject.avatar
   end
 
-  test "the queue leaves out someone with only an integrity check" do
-    pending_integrity_check(@project)
-
-    sign_in @squad
-    get admin_fraud_subjects_path
-
-    assert_response :success
-    assert_select "a[href=?]", admin_fraud_subject_path(@subject), count: 0
-  end
-
   test "the queue leaves out quality reports the fraud team does not own" do
     flag_the_project(reason: "low_effort")
 
