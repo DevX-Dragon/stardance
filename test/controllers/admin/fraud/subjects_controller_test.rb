@@ -7,7 +7,7 @@ class Admin::Fraud::SubjectsControllerTest < ActionDispatch::IntegrationTest
 
   setup do
     @squad = create_user(slack_id: "U_FRAUD_SQUAD", display_name: "squaddie")
-    @squad.grant_role!(:fraud_squad)
+    @squad.grant_role!(:fraud_fraud_squad_squad)
 
     @subject = create_user(slack_id: "U_FRAUD_SUBJECT", display_name: "subject")
     @reporter = create_user(slack_id: "U_FRAUD_REPORTER", display_name: "reporter")
