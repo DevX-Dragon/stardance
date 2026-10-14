@@ -457,6 +457,9 @@ Rails.application.routes.draw do
       end
       resources :fraud_reports, only: [ :create ]
       resources :reviewer_payouts, only: [ :index, :create ] do
+        collection do
+          get :all
+        end
         member do
           post :decision
         end
@@ -468,10 +471,21 @@ Rails.application.routes.draw do
         resources :devlogs, only: [ :index ]
       end
       resources :devlogs, only: [ :index, :show ]
+
+      # Admin-only endpoints for automating stardust payouts.
+      resources :users, only: [] do
+        collection do
+          get :lookup
+        end
+        resources :balance_adjustments, only: [ :create ]
+      end
     end
     namespace :slack do
       post "events", to: "events#create"
     end
+
+    post "privacy/delete", to: "privacy#delete"
+    post "privacy/export", to: "privacy#export"
   end
 
   get "api/v1/docs", to: "api/v1/docs#index", as: :api_v1_docs
@@ -542,6 +556,17 @@ Rails.application.routes.draw do
   get "auth/:provider/callback", to: "sessions#create"
   get "/auth/failure", to: "sessions#failure"
   delete "logout", to: "sessions#destroy"
+  namespace :stats do
+    resource :ship_funnel, only: [ :show ], controller: "ship_funnel" do
+      post :refresh
+    end
+  end
+  namespace :public do
+    resource :growth, only: [ :show ], controller: "growth" do
+      post :rebuild
+    end
+  end
+
   get "dev_login", to: "sessions#dev_login", as: :dev_login_auto if Rails.env.development? || Rails.env.test?
   get "dev_login/:id", to: "sessions#dev_login", as: :dev_login if Rails.env.development? || Rails.env.test?
 
@@ -551,6 +576,11 @@ Rails.application.routes.draw do
   # Home
   get "home", to: "home#index"
   resources :feed_events, only: [ :create ]
+  resources :mihi_activations, only: [ :create ]
+  namespace :buku_x3 do
+    resource :progress, only: [ :show ], controller: "progress"
+    resource :reveal, only: [ :show ]
+  end
   resource :daily_roll, only: [ :create ]
   post "daily_roll/reroll", to: "daily_rolls#reroll", as: :reroll_daily_roll
   get "daily_roll/reroll_status", to: "daily_rolls#reroll_status", as: :reroll_status_daily_roll
@@ -639,14 +669,23 @@ Rails.application.routes.draw do
     post :guest_email_no,            to: "wizard#guest_email_no"
   end
 
+  get "promos/forge", to: "promos#forge", as: :forge_promo
+  get "promos/mipmap", to: "promos#mipmap", as: :mipmap_promo
+  get "promos/wrong_tool", to: "promos#wrong_tool", as: :wrong_tool_promo
+
   namespace :admin, constraints: AdminConstraint do
     # Admin dashboard
     root to: "application#index"
+    resource :buku_x3_event, only: :update
+    get "jim_takeover", to: "buku_x3_events#show", as: :jim_takeover
+    post "jim_takeover/bukux2_contributors", to: "buku_x3_events#export_bukux2", as: :bukux2_contributors_export
     get "dashboard/counts/:key", to: "dashboard_counts#show", as: :dashboard_count
 
     resource :funnel, only: [ :show ], controller: "funnel"
     resource :rating_dashboard, only: [ :show ], controller: "rating_dashboard"
-
+    resource :hour_funnel, only: [ :show ], controller: "hour_funnel" do
+      post :refresh
+    end
     # Sections load lazily so one slow data source can't hold up the page.
     get    "mega_dashboard",                   to: "mega_dashboard#show",        as: :mega_dashboard
     get    "mega_dashboard/sections/:section", to: "mega_dashboard#section",     as: :mega_dashboard_section, constraints: { section: %r{[^/]+} }
@@ -667,20 +706,22 @@ Rails.application.routes.draw do
 
     resources :users, only: [ :index, :show, :update ] do
       scope module: :users do
-        resources :roles,               only: [ :create, :destroy ], param: :name
-        resource  :ban,                 only: [ :create, :destroy ]
-        resource  :impersonation,       only: [ :create ]
-        resources :feature_flags,       only: [ :create, :destroy ], param: :feature
-        resource  :hackatime_sync,      only: [ :create ]
-        resource  :order_rejection,     only: [ :create ]
-        resources :balance_adjustments, only: [ :create ]
-        resource  :grant_cancellation,  only: [ :create ]
-        resource  :verification,        only: [ :create ]
-        resource  :vote_balance,        only: [ :update ]
-        resource  :ysws_override,       only: [ :update ]
-        resources :identities,          only: [ :destroy ]
-        resources :streak_credits,      only: [ :create, :destroy ]
-        resources :votes,               only: [ :index ] do
+        resources :roles,                    only: [ :create, :destroy ], param: :name
+        resource  :ban,                      only: [ :create, :destroy ]
+        resource  :impersonation,            only: [ :create ]
+        resources :feature_flags,            only: [ :create, :destroy ], param: :feature
+        resource  :hackatime_sync,           only: [ :create ]
+        resource  :order_rejection,          only: [ :create ]
+        resources :balance_adjustments,      only: [ :create ]
+        resource  :grant_cancellation,       only: [ :create ]
+        resource  :verification,             only: [ :create ]
+        resource  :vote_balance,             only: [ :update ]
+        resource  :ysws_override,            only: [ :update ]
+        resource  :fraud_payout_eligibility, only: [ :update ]
+        resources :identities,               only: [ :destroy ]
+        resources :streak_credits,           only: [ :create, :destroy ]
+        resource  :streak_calendar,          only: [ :show ]
+        resources :votes,                    only: [ :index ] do
           scope module: :votes do
             resource :discard, only: [ :create ]
           end
@@ -699,6 +740,9 @@ Rails.application.routes.draw do
         post :convert_to_software
         get  :export_devlogs
         get  :votes
+      end
+      scope module: :projects do
+        resource :ship_block, only: [ :create, :destroy ]
       end
     end
     resources :certificates, only: [ :index ] do
@@ -724,7 +768,10 @@ Rails.application.routes.draw do
       # One page per person with fraud work waiting: reports and shop orders are
       # ranked by whoever has waited longest on the thing that matters most.
       # Integrity checks remain supporting context on the subject page.
-      resources :subjects, only: [ :index, :show ]
+      resources :subjects, only: [ :index, :show ] do
+        # The subject's own stardust ledger, pulled into the page on demand.
+        resource :balance, only: [ :show ], controller: "subjects/balances"
+      end
     end
 
     # Referral raffle management (reads the Raffle engine's models).
@@ -881,6 +928,8 @@ Rails.application.routes.draw do
     namespace :certification do
       # Integrity review queue — restricted to admins and fraud leads.
       get "integrity", to: "integrity#index", as: "integrity_reviews"
+      post "integrity/pass_all", to: "integrity#pass_all", as: "pass_all_integrity_reviews"
+      post "integrity/:integrity_id/deductions", to: "integrity/deductions#create", as: "integrity_review_deductions"
       get "integrity/:id", to: "integrity#show", as: "integrity_review"
       patch "integrity/:id", to: "integrity#update"
 
@@ -912,6 +961,14 @@ Rails.application.routes.draw do
         scope module: :funding_requests do
           resource :claim, only: [ :create, :destroy ]
         end
+        collection do
+          post :sync_all_to_airtable
+        end
+      end
+
+      resources :permanent_rejection_nominations, only: [ :index, :show, :create ] do
+        post :approve, on: :member
+        post :deny, on: :member
       end
 
       # Hardware review surface: two separate queues (design funding requests and
@@ -942,17 +999,23 @@ Rails.application.routes.draw do
 
       get "devlogs/:devlog_id/commits", to: "devlog_commits#index", as: "devlog_commits"
 
-      get "review", to: "ysws#index", as: "ysws_reviews"
+      resource :ysws_shortcuts, only: [ :update ], controller: "ysws_shortcuts"
       get "review/dashboard", to: "ysws/dashboard#show", as: "ysws_dashboard"
-      get "review/:id", to: "ysws#show", as: "ysws_review"
-      get "review/:id/commits", to: "ysws#commits", as: "ysws_commits"
-      get "review/:id/double_dip", to: "ysws#double_dip", as: "ysws_double_dip"
-      post "review/:id/report_fraud", to: "ysws#report_fraud", as: "ysws_report_fraud"
-      delete "review/:id/claim", to: "ysws#unclaim", as: "ysws_claim"
-      post "review/:id/complete", to: "ysws#complete", as: "complete_ysws_review"
-      post "review/:id/undo", to: "ysws#undo", as: "undo_ysws_review"
-      post "review/:id/return_to_ship_cert", to: "ysws#return_to_ship_cert", as: "return_to_ship_cert_ysws_review"
-      post "review/:id/resync", to: "ysws#resync", as: "resync_ysws_review"
+      resources :ysws_reviews, path: "review", controller: "ysws", only: [ :index, :show ] do
+        post :next, on: :collection
+
+        member do
+          get :commits
+          get :double_dip
+          post :report_fraud
+          delete :claim, action: :unclaim
+          post :complete
+          post :undo
+          post :skip
+          post :return_to_ship_cert
+          post :resync
+        end
+      end
 
       # Admin payout management
       resources :payouts, only: [ :index, :show ] do
@@ -1031,6 +1094,7 @@ Rails.application.routes.draw do
     resource :mission, only: [ :create, :destroy ], module: :projects, controller: "missions"
     resource :magic, only: [ :create, :destroy ], module: :projects, controller: "magic"
     resource :fire_nomination, only: [ :create, :destroy ], module: :projects
+    resources :mentions, only: [ :new, :create ], module: :projects
     # shallow: false — the guide JS deletes at the nested path, and the
     # controller needs :project_id to scope the completion.
     resources :mission_section_completions,

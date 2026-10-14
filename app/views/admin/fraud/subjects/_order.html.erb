@@ -1,5 +1,9 @@
 <%= turbo_frame_tag order do %>
   <div class="fraud-subject__item fraud-subject__item--order">
+    <% if local_assigns[:error].present? %>
+      <p class="fraud-subject__item-error" role="alert"><%= error %></p>
+    <% end %>
+
     <div class="fraud-subject__item-head">
       <span class="fraud-subject__item-title">
         <%= order.quantity %> × <%= order.shop_item.name %>
@@ -49,11 +53,38 @@
                       class: "fraud-subject__verdict fraud-subject__verdict--accept" %>
       <% end %>
 
+      <% if policy(order).review_order? && order.requires_additional_review? && order.user_id != current_user.id %>
+        <%# A high-value order needs two reviews with a written reason each. The
+            second one also approves it. %>
+        <details class="fraud-subject__second-review">
+          <summary class="fraud-subject__verdict fraud-subject__verdict--accept">
+            Approve (<%= order.review_count(ShopOrderReview::APPROVE) %>/<%= ShopOrderReview::REQUIRED_COUNT %> reviews)
+          </summary>
+
+          <%= form_with url: review_order_admin_shop_order_path(order), class: "fraud-subject__verdict-form" do |f| %>
+            <%= hidden_field_tag :fraud_subject_id, user.id %>
+            <%= hidden_field_tag :verdict, "approve", id: nil %>
+
+            <%= label_tag dom_id(order, :review_reason), "Why this order is fine", class: "fraud-subject__field-label" %>
+            <%= text_area_tag :review_reason, nil, id: dom_id(order, :review_reason), rows: 2, required: true,
+                              class: "fraud-subject__field" %>
+
+            <%= f.submit "Record approval", class: "fraud-subject__verdict fraud-subject__verdict--accept" %>
+          <% end %>
+        </details>
+      <% end %>
+
       <% if policy(order).reject? %>
         <%# Closed, this sits inline with the other buttons; open, the SCSS gives
-            it the full row so the form has somewhere to go. %>
+            it the full row so the form has somewhere to go. On a high-value
+            order the same form records the first rejection and lands the
+            second, so it says which one it is about to be. %>
         <details class="fraud-subject__reject">
-          <summary class="fraud-subject__verdict fraud-subject__verdict--reject">Reject</summary>
+          <summary class="fraud-subject__verdict fraud-subject__verdict--reject">
+            Reject<% if order.high_value? %>
+              (<%= order.review_count(ShopOrderReview::REJECT) %>/<%= ShopOrderReview::REQUIRED_COUNT %> reviews)
+            <% end %>
+          </summary>
 
           <%= form_with url: reject_admin_shop_order_path(order), class: "fraud-subject__verdict-form" do |f| %>
             <%= hidden_field_tag :fraud_subject_id, user.id %>
@@ -61,13 +92,16 @@
             <%= f.label :reason, "Reason shown to the buyer", class: "fraud-subject__field-label" %>
             <%= f.text_field :reason, class: "fraud-subject__field" %>
 
-            <%= f.label :internal_rejection_reason, "Internal reason", class: "fraud-subject__field-label" %>
-            <%= f.text_area :internal_rejection_reason, rows: 2, class: "fraud-subject__field" %>
+            <% if Admin::ShopOrderRejector.records_fraud_details?(order, current_user) %>
+              <%= f.label :internal_rejection_reason, "Internal reason", class: "fraud-subject__field-label" %>
+              <%= f.text_area :internal_rejection_reason, rows: 2, required: true, class: "fraud-subject__field" %>
 
-            <%= f.label :fraud_related_project_id, "Related project", class: "fraud-subject__field-label" %>
-            <%= f.select :fraud_related_project_id,
-                         user.projects.with_deleted.order(created_at: :desc).map { |p| [ p.title, p.id ] },
-                         { include_blank: "Pick a project" }, class: "fraud-subject__field" %>
+              <%= f.label :fraud_related_project_id, "Related project", class: "fraud-subject__field-label" %>
+              <%= f.select :fraud_related_project_id,
+                           fraud_related_project_options(user),
+                           { include_blank: "Pick a project" },
+                           required: true, class: "fraud-subject__field" %>
+            <% end %>
 
             <%= f.submit "Reject order", class: "fraud-subject__verdict fraud-subject__verdict--reject" %>
           <% end %>

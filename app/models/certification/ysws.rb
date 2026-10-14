@@ -81,6 +81,10 @@ module Certification
     scope :pending, -> { where(reviewed_at: nil, returned_at: nil) }
     scope :without_mac_analysis, -> { left_joins(:mac_analysis).where(certification_mac_analyses: { id: nil }) }
 
+    # Finished reviews whose Airtable row the unified base has not taken yet, so
+    # a rewrite still reaches it.
+    scope :rewritable_in_airtable, -> { where.not(reviewed_at: nil).where(in_unified_db: [ nil, "" ]) }
+
     # A review is visible to a reviewer if nobody holds an active claim on it,
     # or they're the one holding it.
     scope :unclaimed_or_claimed_by, ->(user) {
@@ -101,14 +105,6 @@ module Certification
     # N+1 — read it via #todo_devlog_count.
     scope :with_todo_devlog_count, -> {
       select("certification_ysws_reviews.*", "#{TODO_DEVLOG_COUNT_SQL} AS todo_devlog_count")
-    }
-
-    # Reviews whose ship event already carries a decided integrity check, or
-    # whose project is hardware (hardware projects skip integrity checks).
-    scope :with_integrity_check, -> {
-      hardware = joins(:project).where.not(projects: { hardware_stage: nil })
-      decided  = joins(:integrity_check).where.not(certification_integrities: { status: :pending })
-      where(id: hardware).or(where(id: decided))
     }
 
     scope :by_project_type, ->(type) {
@@ -159,12 +155,29 @@ module Certification
     # same review at once can't both win the claim. Returns the claimed
     # record, or nil if another reviewer's claim is still active.
     def self.atomic_claim!(record_id, user)
-      now = Time.current
-      updated = pending.where(id: record_id)
-        .where("claimed_by_id IS NULL OR claimed_at IS NULL OR claimed_at < :expired OR claimed_by_id = :user_id",
-               expired: CLAIM_TTL.ago, user_id: user.id)
-        .update_all(claimed_by_id: user.id, claimed_at: now, updated_at: now)
-      updated.zero? ? nil : find(record_id)
+      transaction do
+        # Keep the previous values stable for the audit event while retaining
+        # the conditional UPDATE that prevents competing claims.
+        review = lock.find(record_id)
+        previous_attributes = review.attributes
+        previous_claim = review.attributes.slice("claimed_by_id", "claimed_at")
+        now = Time.current
+        updated = pending.where(id: record_id)
+          .where("claimed_by_id IS NULL OR claimed_at IS NULL OR claimed_at < :expired OR claimed_by_id = :user_id",
+                 expired: now - CLAIM_TTL, user_id: user.id)
+          .update_all(claimed_by_id: user.id, claimed_at: now, updated_at: now)
+        next nil if updated.zero?
+
+        review.reload
+        review.versions.create!(
+          event: "claim",
+          whodunnit: user.id.to_s,
+          object: previous_attributes,
+          object_changes: previous_claim.to_h { |attribute, value| [ attribute, [ value, review[attribute] ] ] }
+        )
+        Rails.logger.info "[YSWS#claim] user=#{user.id} review=#{review.id} Claimed review"
+        review
+      end
     end
 
     # Count of still-pending child devlog reviews. Available only on records
@@ -737,9 +750,60 @@ module Certification
       update!(claimed_by: nil, claimed_at: nil)
     end
 
+    def completion_blocker
+      return "This review is no longer pending." unless pending?
+
+      check_and_update_unified_db_status!
+      return "This review is already in the unified DB" if in_unified_db.present?
+
+      reviews = devlog_reviews.to_a
+      return "Review all devlogs before completing." if reviews.any?(&:pending?)
+
+      approved = reviews.select(&:approved?)
+      if approved.any? && approved.none? { |review| review.justification.present? }
+        return "Add a justification to at least one approved devlog."
+      end
+
+      if reviews.any? { |review| review.rejected? && review.justification.blank? }
+        return "Add a justification to every rejected devlog."
+      end
+
+      nil
+    end
+
+    def complete_by!(user)
+      update!(
+        reviewer: user,
+        reviewed_at: Time.current,
+        claimed_by: nil,
+        claimed_at: nil
+      )
+    end
+
     def approved_minutes_total
       devlog_reviews.sum { |dr| dr.approved_minutes.to_i }
     end
+
+    # Summed off the devlog reviews rather than read from `original_minutes`,
+    # which only backs the queue's length sort. YswsAirtableSyncJob totals it
+    # the same way, so the two cannot disagree.
+    def original_minutes_total
+      devlog_reviews.sum { |dr| dr.original_minutes.to_i }
+    end
+
+    # What a finished review left on the ship, in hours. Nil while the review is
+    # still open or was returned, because there is no verdict to report yet. A
+    # fraud deduction comes off this figure and not the claimed one, so it is
+    # the number an integrity verdict actually adjusts.
+    def approved_hours
+      return if reviewed_at.nil?
+
+      (approved_minutes_total / 60.0).round(1)
+    end
+
+    def claimed_hours = (original_minutes_total / 60.0).round(1)
+
+    def marked_down? = approved_hours.present? && approved_minutes_total < original_minutes_total
 
     def review_rejected?
       user.banned? || approved_minutes_total < MIN_APPROVED_MINUTES

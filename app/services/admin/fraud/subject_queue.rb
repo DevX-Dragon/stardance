@@ -4,38 +4,133 @@ module Admin
     # person at a time instead of three separate queues that keep handing them
     # the same person.
     #
-    # Two sources feed the default queue: reports on reasons the fraud team owns
-    # and shop orders awaiting a verdict. Integrity checks stay available on a
-    # person's detail page, but do not put someone into this queue by themselves.
-    # Each item scores its age in days times a weight, and a person's priority is
+    # Three sources feed it: flags (Project::Report on a reason the fraud team
+    # owns), shop orders awaiting a verdict, and pending integrity checks. Each
+    # item scores its age in days times a weight, and a person's priority is
     # their single highest-scoring item. Highest wins.
     #
-    # MAX rather than SUM: one genuinely old report should outrank a pile of
-    # fresh orders, and nobody should reach the top of the queue on volume alone.
+    # MAX rather than SUM: one genuinely old flag should outrank a pile of fresh
+    # integrity checks, and nobody should reach the top of the queue on volume
+    # alone.
     class SubjectQueue
       FLAG_WEIGHT = 3.0
       ORDER_WEIGHT = 2.0
+      INTEGRITY_WEIGHT = 1.0
 
-      Subject = Data.define(:user_id, :priority, :flag_count, :order_count, :oldest_at) do
-        def item_count = flag_count + order_count
+      # A check actually enters the queue at its ship's first GOI verdict, so count time from then
+      INTEGRITY_QUEUED_AT_SQL = <<~SQL.squish.freeze
+        GREATEST(
+          certification_integrities.created_at,
+          (SELECT MIN(certification_ysws_reviews.reviewed_at) FROM certification_ysws_reviews
+           WHERE certification_ysws_reviews.post_ship_event_id = certification_integrities.ship_event_id)
+        )
+      SQL
+
+      Subject = Data.define(:user_id, :priority, :flag_count, :order_count, :integrity_count, :oldest_at) do
+        def item_count = flag_count + order_count + integrity_count
       end
 
       # One row per person with work waiting, ordered by priority. Banned people
       # are left out: a ban already rejects their orders and soft-deletes their
       # projects, so there is no verdict left to give.
-      def self.relation
-        ::User.where(banned: false)
-              .joins("INNER JOIN (#{items_sql}) fraud_items ON fraud_items.user_id = users.id")
-              .group("users.id")
-              .select(<<~SQL.squish)
-                users.id AS user_id,
-                MAX(fraud_items.weight * EXTRACT(EPOCH FROM (NOW() - fraud_items.created_at)) / 86400.0) AS priority,
-                COUNT(*) FILTER (WHERE fraud_items.kind = 'flag') AS flag_count,
-                COUNT(*) FILTER (WHERE fraud_items.kind = 'order') AS order_count,
-                MIN(fraud_items.created_at) AS oldest_at
-              SQL
-              .order(Arel.sql("priority DESC"))
+      #
+      # Pass a reviewer to get the queue as it should look to them: anyone
+      # another reviewer is currently holding drops out, since opening them only
+      # leads to a page that refuses verdicts, and so does any order waiting on
+      # a second reviewer they cannot be.
+      def self.relation(reviewer: nil)
+        scope = ::User.where(banned: false)
+                      .joins("INNER JOIN (#{items_sql(reviewer)}) fraud_items ON fraud_items.user_id = users.id")
+                      .group("users.id")
+                      .select(<<~SQL.squish)
+                        users.id AS user_id,
+                        MAX(fraud_items.weight * EXTRACT(EPOCH FROM (NOW() - fraud_items.created_at)) / 86400.0) AS priority,
+                        COUNT(*) FILTER (WHERE fraud_items.kind = 'flag') AS flag_count,
+                        COUNT(*) FILTER (WHERE fraud_items.kind = 'order') AS order_count,
+                        COUNT(*) FILTER (WHERE fraud_items.kind = 'integrity') AS integrity_count,
+                        MIN(fraud_items.created_at) AS oldest_at
+                      SQL
+                      .order(Arel.sql("priority DESC"))
+
+        reviewer ? scope.where.not(id: held_by_others(reviewer)) : scope
       end
+
+      # One [arrived, left] stay per person on the page, left nil while they are still there.
+      def self.history(since)
+        item_spans(since).group_by(&:first)
+                         .flat_map { |_, spans| merge_spans(spans.map { |_, arrived, left| [ arrived, left ] }) }
+                         .select { |_, left| left.nil? || left >= since }
+      end
+
+      # All of each active person's items, so a stay that began before `since` is not cut short.
+      def self.item_spans(since)
+        sources = span_sources
+        active = sources.flat_map do |scope, user_id, _, left|
+          scope.where(left.eq(nil).or(left.gteq(since))).distinct.pluck(user_id)
+        end.uniq
+
+        sources.flat_map do |scope, user_id, arrived, left|
+          scope.where(user_id.in(active)).pluck(user_id, arrived, left)
+        end
+      end
+
+      def self.span_sources
+        banned_at = "CASE WHEN users.banned THEN COALESCE(users.banned_at, users.updated_at) END"
+        queue_states = ::ShopOrder::FRAUD_REVIEW_STATES.map { |state| ::ActiveRecord::Base.connection.quote(state) }.join(", ")
+        auto_approved = ::PaperTrail::Version.where(item_type: "ShopOrder", event: "auto_approved").select(Arel.sql("versions.item_id::bigint"))
+
+        [
+          [
+            ::Project::Report.where(reason: ::Project::Report::FRAUD_REVIEW_REASONS)
+              .joins("INNER JOIN projects ON projects.id = project_reports.project_id")
+              .joins("INNER JOIN project_memberships ON project_memberships.project_id = project_reports.project_id")
+              .joins("INNER JOIN users ON users.id = project_memberships.user_id"),
+            "project_memberships.user_id",
+            "project_reports.created_at",
+            "CASE WHEN project_reports.status = 0 AND projects.deleted_at IS NULL THEN NULL " \
+              "ELSE LEAST(CASE WHEN project_reports.status <> 0 THEN project_reports.updated_at END, projects.deleted_at) END"
+          ],
+          [
+            ::ShopOrder.without_streak_stickers.where.not(id: auto_approved).joins(:user),
+            "shop_orders.user_id",
+            "shop_orders.created_at",
+            # Verification and refunds record no timestamp, so the last update stands in.
+            "CASE WHEN shop_orders.aasm_state IN (#{queue_states}) THEN NULL " \
+              "ELSE COALESCE(LEAST(shop_orders.rejected_at, shop_orders.awaiting_periodical_fulfillment_at, shop_orders.fulfilled_at), shop_orders.updated_at) END"
+          ],
+          [
+            ::Certification::Integrity.where.not(status: :auto_passed).past_goi
+              .joins("INNER JOIN posts ON posts.postable_id = certification_integrities.ship_event_id AND posts.postable_type = 'Post::ShipEvent'")
+              .joins("INNER JOIN users ON users.id = posts.user_id"),
+            "posts.user_id",
+            INTEGRITY_QUEUED_AT_SQL,
+            "CASE WHEN certification_integrities.status = #{::Certification::Integrity.statuses[:pending]} THEN NULL " \
+              "ELSE COALESCE(certification_integrities.reviewed_at, certification_integrities.updated_at) END"
+          ]
+        ].map do |scope, user_id, arrived, left|
+          [ scope, Arel.sql(user_id), Arel.sql(arrived), Arel::Nodes::NamedFunction.new("LEAST", [ Arel.sql(left), Arel.sql(banned_at) ]) ]
+        end
+      end
+
+      def self.merge_spans(spans)
+        spans.sort_by(&:first).each_with_object([]) do |(arrived, left), stays|
+          last = stays.last
+          if last && (last[1].nil? || arrived <= last[1])
+            last[1] = left && [ last[1], left ].max
+          else
+            stays << [ arrived, left ]
+          end
+        end
+      end
+
+      # A reviewer's own claim is deliberately left in: they should be able to
+      # get back to a person they are part way through.
+      def self.held_by_others(reviewer)
+        ::FraudSubjectClaim.active.where.not(reviewer_id: reviewer.id).select(:subject_id)
+      end
+
+      # The queue as one reviewer should see it.
+      def self.subjects_for(reviewer) = subjects(relation(reviewer: reviewer))
 
       def self.subjects(relation = self.relation)
         relation.map do |row|
@@ -44,6 +139,7 @@ module Admin
             priority: row.priority.to_f,
             flag_count: row.flag_count,
             order_count: row.order_count,
+            integrity_count: row.integrity_count,
             oldest_at: row.oldest_at
           )
         end
@@ -55,24 +151,27 @@ module Admin
       def self.flags
         ::Project::Report.pending
           .where(reason: ::Project::Report::FRAUD_REVIEW_REASONS)
+          .joins(:project)
           .joins("INNER JOIN project_memberships ON project_memberships.project_id = project_reports.project_id")
           .select("project_memberships.user_id AS user_id, project_reports.created_at AS created_at")
       end
 
-      def self.orders
-        ::ShopOrder.where(aasm_state: ::ShopOrder::FRAUD_REVIEW_STATES)
-                   .select("shop_orders.user_id AS user_id, shop_orders.created_at AS created_at")
+      def self.orders(reviewer: nil)
+        waiting_orders(::ShopOrder.all, reviewer: reviewer)
+          .select("shop_orders.user_id AS user_id, shop_orders.created_at AS created_at")
       end
 
+      # Held back until the GOI has reviewed the ship, so a deduction is weighed
+      # against the hours the GOI approved rather than the raw claim.
       def self.integrity_checks
-        ::Certification::Integrity.pending
+        ::Certification::Integrity.pending.past_goi
           .joins("INNER JOIN posts ON posts.postable_id = certification_integrities.ship_event_id AND posts.postable_type = 'Post::ShipEvent'")
-          .select("posts.user_id AS user_id, certification_integrities.created_at AS created_at")
+          .select("posts.user_id AS user_id, #{INTEGRITY_QUEUED_AT_SQL} AS created_at")
       end
 
-      # The review sources narrowed to one person. The subject page and verdict
-      # responses read them from here so filters cannot drift between the queue
-      # and the page it opens.
+      # The same three sources, narrowed to one person. The subject page and the
+      # verdict responses both read them from here so a filter can never drift
+      # between the queue and the page it opens.
       def self.flags_for(user)
         ::Project::Report.pending
           .where(project: user.projects, reason: ::Project::Report::FRAUD_REVIEW_REASONS)
@@ -80,25 +179,57 @@ module Admin
           .order(created_at: :asc)
       end
 
-      def self.orders_for(user)
-        user.shop_orders
-            .where(aasm_state: ::ShopOrder::FRAUD_REVIEW_STATES)
-            .includes(:shop_item)
-            .order(created_at: :asc)
-      end
-
-      def self.integrity_checks_for(user)
-        ::Certification::Integrity.pending
-          .joins(ship_event: :post)
-          .where(posts: { user_id: user.id })
-          .includes(ship_event: { post: :project })
+      def self.orders_for(user, reviewer: nil)
+        waiting_orders(user.shop_orders, reviewer: reviewer)
+          .includes(:shop_item, :reviews)
           .order(created_at: :asc)
       end
 
-      def self.items_sql
+      # A two-approval order the reviewer has already reviewed is waiting on
+      # someone else, so it is not their work.
+      def self.waiting_orders(scope, reviewer:)
+        scope = scope.where(aasm_state: ::ShopOrder::FRAUD_REVIEW_STATES)
+        return scope unless reviewer
+
+        scope.where.not(id: ::ShopOrderReview.awaiting_another_reviewer(reviewer))
+      end
+
+      # The checks a cascading verdict settled alongside the one actually
+      # decided: same person, same project, no longer pending. Their rows leave
+      # the list on its own refresh, but nothing else knows they moved.
+      def self.cascaded_siblings_of(check, user:)
+        project_id = check.ship_event&.post&.project_id
+        return ::Certification::Integrity.none if project_id.nil?
+
+        ::Certification::Integrity.where.not(status: :pending)
+          .where.not(id: check.id)
+          .joins(ship_event: :post)
+          .where(posts: { user_id: user.id, project_id: project_id })
+      end
+
+      # The next person a reviewer should pick up: highest priority first,
+      # skipping the one they just finished and anyone another reviewer is
+      # currently holding.
+      def self.next_subject_id(reviewer:, after: nil)
+        scope = relation(reviewer: reviewer)
+        scope = scope.where.not(id: after.id) if after
+
+        scope.first&.user_id
+      end
+
+      def self.integrity_checks_for(user)
+        ::Certification::Integrity.pending.past_goi
+          .joins(ship_event: :post)
+          .where(posts: { user_id: user.id })
+          .includes(ship_event: [ { post: :project }, { ysws_review: :devlog_reviews } ])
+          .order(created_at: :asc)
+      end
+
+      def self.items_sql(reviewer)
         [
           branch_sql(flags, "flag", FLAG_WEIGHT),
-          branch_sql(orders, "order", ORDER_WEIGHT)
+          branch_sql(orders(reviewer: reviewer), "order", ORDER_WEIGHT),
+          branch_sql(integrity_checks, "integrity", INTEGRITY_WEIGHT)
         ].join(" UNION ALL ")
       end
 
@@ -106,7 +237,7 @@ module Admin
         "SELECT user_id, created_at, #{::ActiveRecord::Base.connection.quote(kind)} AS kind, #{weight} AS weight FROM (#{scope.to_sql}) AS #{kind}_items"
       end
 
-      private_class_method :items_sql, :branch_sql
+      private_class_method :waiting_orders, :items_sql, :branch_sql, :item_spans, :span_sources, :merge_spans
     end
   end
 end

@@ -100,6 +100,7 @@ gem "omniauth-rails_csrf_protection"
 gem "omniauth_openid_connect"
 gem "omniauth-oauth2"
 gem "omniauth-github", "~> 2.0"
+gem "jwt", "~> 3.2"
 
 gem "raffle", path: "engines/raffle"
 gem "slack-ruby-client"
@@ -128,9 +129,6 @@ gem "faraday-retry"
 
 gem "faker", "~> 3.6"
 gem "jsbundling-rails", "~> 1.3"
-gem "stackprof"
-gem "sentry-ruby", "~> 6.7"
-gem "sentry-rails", "~> 6.7"
 
 # for pagination
 gem "pagy", "~> 43.6"

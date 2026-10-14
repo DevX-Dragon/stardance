@@ -77,8 +77,11 @@ module Admin
 
     # Map of allowed item types to their classes for safe lookup
     ALLOWED_ITEM_CLASSES = {
+      "BukuX3::Event" => "BukuX3::Event",
+      "MihiActivation" => "MihiActivation",
       "User" => "User",
       "User::Identity" => "User::Identity",
+      "User::HackatimeProject" => "User::HackatimeProject",
       "Project" => "Project",
       "Project::Membership" => "Project::Membership",
       "Project::Report" => "Project::Report",
